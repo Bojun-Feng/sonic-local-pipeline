@@ -1,0 +1,71 @@
+# Lima VM template for SONiC ARM virtual switch builds
+# Requires: macOS with Apple Silicon (M3+ for nested virtualization)
+# Usage: limactl create --name=vm-sonic-build ./vm-sonic-build.yaml --tty=false
+
+vmType: "vz"
+arch: "aarch64"
+nestedVirtualization: true
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 4
+memory: "16GiB"
+disk: "250GiB"
+
+ssh:
+  forwardAgent: true
+  loadDotSSHPubKeys: true
+
+containerd:
+  system: false
+  user: false
+
+# Mount the output directory as writable so logs + binaries stream directly to host
+mounts:
+  - location: "~/Documents/sonic-build-pipeline"
+    writable: true
+
+provision:
+  # ── System-level prereqs (runs as root) ──
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      # Core packages
+      apt-get update
+      apt-get install -y \
+        python3-pip git ca-certificates curl gnupg lsb-release \
+        make gcc g++ jq sudo
+
+      # jinjanator (provides j2)
+      pip3 install jinjanator
+
+      # Docker (official convenience script)
+      if ! command -v docker &>/dev/null; then
+        curl -fsSL https://get.docker.com | sh
+      fi
+
+      # Let the lima user run docker without sudo
+      usermod -aG docker "{{.User}}"
+
+      # Kernel module needed by SONiC build
+      modprobe overlay || true
+
+probes:
+  - mode: readiness
+    description: "docker is usable"
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      # Use sudo because the user may not have picked up the docker group yet
+      if ! timeout 60 bash -c "until sudo docker info &>/dev/null; do sleep 3; done"; then
+        echo >&2 "docker is not ready yet"
+        exit 1
+      fi
+    hint: |
+      Docker is not ready in the guest. Check /var/log/cloud-init-output.log inside the VM.
+
