@@ -1,20 +1,56 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────
-# sonic-build.sh — One-shot SONiC ARM virtual-switch build via Lima VM
+# sonic-build.sh — SONiC ARM virtual-switch build via Lima VM
 #
 # Usage:
-#   ./sonic-build.sh <commit_hash> [title]
+#   Remote build (clone from GitHub):
+#     ./sonic-build.sh <commit_hash> [-t|--title <title>]
+#
+#   Local build (use existing ./sonic-buildimage):
+#     ./sonic-build.sh -l|--local [-t|--title <title>]
 #
 # Examples:
 #   ./sonic-build.sh abc1234
-#   ./sonic-build.sh abc1234 "fix-bgp-crash"
+#   ./sonic-build.sh abc1234 -t "fix-bgp-crash"
+#   ./sonic-build.sh --local
+#   ./sonic-build.sh -l --title "my-local-build"
+#
+# Options:
+#   -l, --local     Use local ./sonic-buildimage directory instead of cloning
+#   -t, --title     Optional title for the build run (used in output directory name)
+#   -h, --help      Show this help message
+#
+# For local builds (-l), you MUST have sonic-buildimage in the script directory.
+# If it doesn't exist, follow these steps:
+#
+#   Step 1: Clone the repository (without submodules for faster download)
+#     cd /Users/bojunfeng/cs/sonic-on-mac
+#     git clone https://github.com/sonic-net/sonic-buildimage.git
+#     cd sonic-buildimage
+#
+#   Step 2: Checkout the desired version and initialize submodules
+#     git checkout <your-commit-hash>
+#     git submodule update --init --recursive
+#
+#   Step 3: Run the build
+#     cd ..
+#     ./sonic-build.sh --local [-t <title>]
+#
+#   Example with a specific commit:
+#     cd /Users/bojunfeng/cs/sonic-on-mac
+#     git clone https://github.com/sonic-net/sonic-buildimage.git
+#     cd sonic-buildimage
+#     git checkout 061375b0077bf744055cc152e96e8e42570a795c
+#     git submodule update --init --recursive
+#     cd ..
+#     ./sonic-build.sh -l -t "my-build"
 #
 # The script will:
 #   1. Tear down any existing vm-sonic-build Lima VM
 #   2. Create a fresh Ubuntu 22.04 ARM VM with nested virtualisation
 #   3. Install all SONiC build prerequisites inside it
-#   4. Resolve the commit in sonic-net/sonic-buildimage or your fork
-#   5. Clone, checkout, and build target/sonic-vs-arm64.bin
+#   4. Either clone from GitHub or copy local repo into the VM
+#   5. Build target/sonic-vs-arm64.bin
 #   6. Stream real-time logs to ~/Documents/sonic-build-pipeline/<run>/
 #   7. Copy the resulting .bin to the same directory
 #
@@ -30,6 +66,8 @@ VM_NAME="vm-sonic-build"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 YAML_TEMPLATE="${SCRIPT_DIR}/vm-sonic-build.yaml"
 OUTPUT_ROOT="$HOME/Documents/sonic-build-pipeline"
+
+LOCAL_SONIC_DIR="${SCRIPT_DIR}/sonic-buildimage"
 
 UPSTREAM_REPO="https://github.com/sonic-net/sonic-buildimage.git"
 FORK_REPO="https://github.com/Bojun-Feng/sonic-buildimage.git"
@@ -49,14 +87,107 @@ SONIC_BUILD_FLAGS=(
   "NOTRIXIE=1"
 )
 
-# ── Args ─────────────────────────────────────────────────────────────
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <commit_hash> [title]"
+# ── Helpers ──────────────────────────────────────────────────────────
+info()  { echo -e "\033[1;34m[INFO]\033[0m  $*"; }
+ok()    { echo -e "\033[1;32m[OK]\033[0m    $*"; }
+warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
+err()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
+fatal() { err "$@"; exit 1; }
+
+run_in_vm() {
+  limactl shell "$VM_NAME" "$@"
+}
+
+usage() {
+  echo "Usage:"
+  echo "  $0 <commit_hash> [-t|--title <title>]    # Clone from GitHub"
+  echo "  $0 -l|--local [-t|--title <title>]       # Use local ./sonic-buildimage"
+  echo ""
+  echo "Options:"
+  echo "  -l, --local     Use local ./sonic-buildimage directory"
+  echo "  -t, --title     Optional title for the build run"
+  echo "  -h, --help      Show this help message"
   exit 1
+}
+
+show_local_setup_instructions() {
+  echo ""
+  echo "════════════════════════════════════════════════════════════════"
+  echo "  Please clone sonic-buildimage first:"
+  echo ""
+  echo "  Step 1: Clone the repository (without submodules for faster download)"
+  echo "    cd ${SCRIPT_DIR}"
+  echo "    git clone https://github.com/sonic-net/sonic-buildimage.git"
+  echo "    cd sonic-buildimage"
+  echo ""
+  echo "  Step 2: Checkout the desired version and initialize submodules"
+  echo "    git checkout <your-commit-hash>"
+  echo "    git submodule update --init --recursive"
+  echo ""
+  echo "  Step 3: Run the build"
+  echo "    cd .."
+  echo "    ./sonic-build.sh --local [-t <title>]"
+  echo ""
+  echo "  Example with a specific commit:"
+  echo "    cd ${SCRIPT_DIR}"
+  echo "    git clone https://github.com/sonic-net/sonic-buildimage.git"
+  echo "    cd sonic-buildimage"
+  echo "    git checkout 061375b0077bf744055cc152e96e8e42570a795c"
+  echo "    git submodule update --init --recursive"
+  echo "    cd .."
+  echo "    ./sonic-build.sh -l -t \"my-build\""
+  echo ""
+  echo "════════════════════════════════════════════════════════════════"
+}
+
+# ── Parse Args ───────────────────────────────────────────────────────
+LOCAL_MODE=false
+TITLE=""
+COMMIT_HASH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -l|--local)
+      LOCAL_MODE=true
+      shift
+      ;;
+    -t|--title)
+      if [[ -z "${2:-}" ]]; then
+        err "Option $1 requires an argument"
+        usage
+      fi
+      TITLE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      ;;
+    -*)
+      err "Unknown option: $1"
+      usage
+      ;;
+    *)
+      if [[ -z "$COMMIT_HASH" ]]; then
+        COMMIT_HASH="$1"
+      else
+        err "Unexpected argument: $1"
+        usage
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Validate args
+if [[ "$LOCAL_MODE" == false && -z "$COMMIT_HASH" ]]; then
+  err "Either specify a commit hash or use --local mode"
+  usage
 fi
 
-COMMIT_HASH="$1"
-TITLE="${2:-}"
+if [[ "$LOCAL_MODE" == true && -n "$COMMIT_HASH" ]]; then
+  err "Cannot specify both --local and a commit hash"
+  usage
+fi
 
 # ── Derived paths ────────────────────────────────────────────────────
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -69,39 +200,59 @@ fi
 LOG_CONFIGURE="${RUN_DIR}/sonic_configure_${TS}.log"
 LOG_BUILD="${RUN_DIR}/sonic_build_${TS}.log"
 LOG_VM="${RUN_DIR}/vm_setup_${TS}.log"
+LOG_COPY="${RUN_DIR}/sonic_copy_${TS}.log"
 
 mkdir -p "$RUN_DIR"
 
-# ── Helpers ──────────────────────────────────────────────────────────
-info()  { echo -e "\033[1;34m[INFO]\033[0m  $*"; }
-ok()    { echo -e "\033[1;32m[OK]\033[0m    $*"; }
-err()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
-fatal() { err "$@"; exit 1; }
+# ══════════════════════════════════════════════════════════════════════
+# MODE-SPECIFIC: Validate source and set variables
+# ══════════════════════════════════════════════════════════════════════
 
-run_in_vm() {
-  # Run a command inside the VM as the default user.
-  # Usage: run_in_vm [--workdir /path] command args...
-  limactl shell "$VM_NAME" "$@"
-}
+if [[ "$LOCAL_MODE" == true ]]; then
+  # ── Local mode: verify local sonic-buildimage exists ───────────────
+  info "Mode: LOCAL (using ${LOCAL_SONIC_DIR})"
+  
+  if [[ ! -d "$LOCAL_SONIC_DIR" ]]; then
+    err "Local sonic-buildimage directory not found!"
+    show_local_setup_instructions
+    exit 1
+  fi
 
-# ── 1. Resolve commit ────────────────────────────────────────────────
-info "Resolving commit ${COMMIT_HASH}..."
+  if [[ ! -d "${LOCAL_SONIC_DIR}/.git" ]]; then
+    fatal "Directory exists but is not a git repository: ${LOCAL_SONIC_DIR}"
+  fi
 
-CLONE_URL=""
-if git ls-remote "$UPSTREAM_REPO" | grep -q "^${COMMIT_HASH}"; then
-  CLONE_URL="$UPSTREAM_REPO"
-  ok "Found in sonic-net/sonic-buildimage"
-elif git ls-remote "$FORK_REPO" | grep -q "^${COMMIT_HASH}"; then
-  CLONE_URL="$FORK_REPO"
-  ok "Found in Bojun-Feng/sonic-buildimage"
+  # Get current commit info for logging
+  CURRENT_COMMIT="$(cd "$LOCAL_SONIC_DIR" && git rev-parse HEAD 2>/dev/null || echo 'unknown')"
+  CURRENT_BRANCH="$(cd "$LOCAL_SONIC_DIR" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'detached')"
+
+  ok "Found local sonic-buildimage"
+  info "  Commit: ${CURRENT_COMMIT}"
+  info "  Branch: ${CURRENT_BRANCH}"
+
 else
-  # ls-remote only shows refs; for arbitrary commits we try a shallow fetch
-  # inside the VM later and let it fail if truly missing.
-  info "Commit not found in ls-remote (may be a mid-branch commit). Will try upstream first."
-  CLONE_URL="$UPSTREAM_REPO"
+  # ── Remote mode: resolve commit ────────────────────────────────────
+  info "Mode: REMOTE (cloning from GitHub)"
+  info "Resolving commit ${COMMIT_HASH}..."
+
+  CLONE_URL=""
+  if git ls-remote "$UPSTREAM_REPO" | grep -q "^${COMMIT_HASH}"; then
+    CLONE_URL="$UPSTREAM_REPO"
+    ok "Found in sonic-net/sonic-buildimage"
+  elif git ls-remote "$FORK_REPO" | grep -q "^${COMMIT_HASH}"; then
+    CLONE_URL="$FORK_REPO"
+    ok "Found in Bojun-Feng/sonic-buildimage"
+  else
+    info "Commit not found in ls-remote (may be a mid-branch commit). Will try upstream first."
+    CLONE_URL="$UPSTREAM_REPO"
+  fi
 fi
 
-# ── 2. Tear down existing VM ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# COMMON: VM Setup
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Tear down existing VM ────────────────────────────────────────────
 info "Tearing down any existing '${VM_NAME}' VM..."
 if limactl list -q 2>/dev/null | grep -qx "$VM_NAME"; then
   limactl stop  "$VM_NAME" --force 2>/dev/null || true
@@ -111,7 +262,7 @@ else
   ok "No existing VM."
 fi
 
-# ── 3. Create & start fresh VM ──────────────────────────────────────
+# ── Create & start fresh VM ──────────────────────────────────────────
 info "Creating VM from ${YAML_TEMPLATE}..."
 info "  Output directory: ${RUN_DIR}"
 info "  This takes a few minutes (Ubuntu image download + Docker install)."
@@ -126,37 +277,86 @@ info "Starting VM..."
 limactl start "$VM_NAME" --tty=false 2>&1 | tee -a "$LOG_VM"
 ok "VM is up."
 
-# ── 4. Verify docker works inside the VM ─────────────────────────────
+# ── Verify docker works inside the VM ────────────────────────────────
 info "Verifying Docker inside guest..."
 run_in_vm -- sudo docker info >/dev/null 2>&1 \
   || fatal "Docker is not working inside the VM. Check ${LOG_VM}"
 ok "Docker OK."
 
-# ── 5. Clone & checkout ─────────────────────────────────────────────
-GUEST_WORKDIR="$(limactl shell "$VM_NAME" -- bash -c 'echo $HOME' 2>/dev/null | tr -d '[:space:]')/sonic-buildimage"
+# ══════════════════════════════════════════════════════════════════════
+# MODE-SPECIFIC: Get source code into VM
+# ══════════════════════════════════════════════════════════════════════
 
-info "Cloning ${CLONE_URL} (with submodules)..."
-run_in_vm -- sg docker -c "
-  set -eux
-  git clone --recurse-submodules '${CLONE_URL}' '${GUEST_WORKDIR}'
-" 2>&1 | tee -a "$LOG_VM"
+GUEST_HOME="$(limactl shell "$VM_NAME" -- bash -c 'echo $HOME' 2>/dev/null | tr -d '[:space:]')"
+GUEST_WORKDIR="${GUEST_HOME}/sonic-buildimage"
 
-info "Checking out ${COMMIT_HASH}..."
-run_in_vm -- sg docker -c "
-  set -eux
-  cd '${GUEST_WORKDIR}'
-  git checkout '${COMMIT_HASH}' || {
-    # If the commit isn't in upstream, try adding fork as a remote
-    git remote add fork '${FORK_REPO}' 2>/dev/null || true
-    git fetch fork
-    git checkout '${COMMIT_HASH}'
-  }
-  git submodule update --init --recursive
-" 2>&1 | tee -a "$LOG_VM"
+if [[ "$LOCAL_MODE" == true ]]; then
+  # ── Local mode: copy local repo to VM ──────────────────────────────
+  info "Copying local sonic-buildimage to VM..."
+  info "  Source: ${LOCAL_SONIC_DIR}"
+  info "  Destination: ${VM_NAME}:${GUEST_WORKDIR}"
+  info "  This may take several minutes depending on repo size..."
+  info "  Streaming to: ${LOG_COPY}"
 
-ok "Repo ready at ${GUEST_WORKDIR}"
+  TAR_FILE="${RUN_DIR}/sonic-buildimage.tar"
 
-# ── 6. Configure ────────────────────────────────────────────────────
+  info "Creating tarball of local repo (this may take a while)..."
+  tar -cf "$TAR_FILE" -C "$SCRIPT_DIR" sonic-buildimage 2>&1 | tee "$LOG_COPY"
+  ok "Tarball created: $(du -h "$TAR_FILE" | cut -f1)"
+
+  info "Copying tarball to VM..."
+  limactl copy "$TAR_FILE" "${VM_NAME}:${GUEST_HOME}/sonic-buildimage.tar" 2>&1 | tee -a "$LOG_COPY"
+  ok "Tarball copied to VM."
+
+  info "Extracting tarball in VM..."
+  run_in_vm -- bash -c "
+    set -eux
+    cd '${GUEST_HOME}'
+    tar -xf sonic-buildimage.tar
+    rm sonic-buildimage.tar
+  " 2>&1 | tee -a "$LOG_COPY"
+  ok "Extraction complete."
+
+  rm -f "$TAR_FILE"
+  info "Cleaned up temporary tarball."
+
+  run_in_vm -- bash -c "
+    set -eux
+    cd '${GUEST_WORKDIR}'
+    git status
+    git log -1 --oneline
+  " 2>&1 | tee -a "$LOG_COPY"
+
+  ok "Repo ready at ${GUEST_WORKDIR}"
+
+else
+  # ── Remote mode: clone & checkout ──────────────────────────────────
+  info "Cloning ${CLONE_URL} (with submodules)..."
+  run_in_vm -- sg docker -c "
+    set -eux
+    git clone --recurse-submodules '${CLONE_URL}' '${GUEST_WORKDIR}'
+  " 2>&1 | tee -a "$LOG_VM"
+
+  info "Checking out ${COMMIT_HASH}..."
+  run_in_vm -- sg docker -c "
+    set -eux
+    cd '${GUEST_WORKDIR}'
+    git checkout '${COMMIT_HASH}' || {
+      git remote add fork '${FORK_REPO}' 2>/dev/null || true
+      git fetch fork
+      git checkout '${COMMIT_HASH}'
+    }
+    git submodule update --init --recursive
+  " 2>&1 | tee -a "$LOG_VM"
+
+  ok "Repo ready at ${GUEST_WORKDIR}"
+fi
+
+# ══════════════════════════════════════════════════════════════════════
+# COMMON: Configure & Build
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Configure ────────────────────────────────────────────────────────
 info "Running make init && make configure..."
 info "  Streaming to: ${LOG_CONFIGURE}"
 
@@ -170,12 +370,11 @@ run_in_vm -- sg docker -c "
 
 ok "Configure complete."
 
-# ── 7. Build ─────────────────────────────────────────────────────────
+# ── Build ────────────────────────────────────────────────────────────
 info "Starting build: ${BUILD_TARGET}"
 info "  Streaming to: ${LOG_BUILD}"
 info "  This will take a long time..."
 
-# Build the make flags string
 MAKE_FLAGS=""
 for f in "${SONIC_BUILD_FLAGS[@]}"; do
   MAKE_FLAGS+="${f} "
@@ -190,28 +389,42 @@ run_in_vm -- sg docker -c "
 
 ok "Build finished."
 
-# ── 8. Copy artefacts ───────────────────────────────────────────────
+# ── Copy artefacts ───────────────────────────────────────────────────
 info "Copying build artefact to ${RUN_DIR}..."
 
-# The output dir is already mounted writable, but the build happens in the
-# guest home dir. Use limactl copy to pull it out.
 BIN_NAME="$(basename "$BUILD_TARGET")"
 limactl copy "$VM_NAME:${GUEST_WORKDIR}/${BUILD_TARGET}" "${RUN_DIR}/${BIN_NAME}" \
   && ok "Artefact saved: ${RUN_DIR}/${BIN_NAME}" \
   || err "Could not copy ${BUILD_TARGET}. It may not have been produced."
 
-# ── 9. Summary ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# Summary
+# ══════════════════════════════════════════════════════════════════════
+
 echo ""
 echo "════════════════════════════════════════════════════════════════"
 info "Build run complete."
-echo "  Commit:     ${COMMIT_HASH}"
+
+if [[ "$LOCAL_MODE" == true ]]; then
+  echo "  Mode:       LOCAL"
+  echo "  Source:     ${LOCAL_SONIC_DIR}"
+  echo "  Commit:     ${CURRENT_COMMIT}"
+  echo "  Branch:     ${CURRENT_BRANCH}"
+else
+  echo "  Mode:       REMOTE"
+  echo "  Commit:     ${COMMIT_HASH}"
+  echo "  Repository: ${CLONE_URL}"
+fi
+
 echo "  VM:         ${VM_NAME} (still running — stop with: limactl stop ${VM_NAME})"
 echo "  Logs:       ${RUN_DIR}/"
 echo "    VM setup: ${LOG_VM}"
+if [[ "$LOCAL_MODE" == true ]]; then
+  echo "    Copy:     ${LOG_COPY}"
+fi
 echo "    Configure:${LOG_CONFIGURE}"
 echo "    Build:    ${LOG_BUILD}"
 if [[ -f "${RUN_DIR}/${BIN_NAME}" ]]; then
   echo "  Artefact:   ${RUN_DIR}/${BIN_NAME}"
 fi
 echo "════════════════════════════════════════════════════════════════"
-
