@@ -74,17 +74,17 @@ FORK_REPO="https://github.com/Bojun-Feng/sonic-buildimage.git"
 
 BUILD_JOBS=4
 PLATFORM="vs"
-PLATFORM_ARCH="arm64"
-BUILD_TARGET="target/sonic-vs-arm64.bin"
+PLATFORM_ARCH="amd64"
+BUILD_TARGET="target/sonic-vs.img.gz"
 
 # SONiC build flags (adjust as needed)
 SONIC_BUILD_FLAGS=(
   "SONIC_BUILD_JOBS=${BUILD_JOBS}"
-  "SONIC_BUILD_RETRY_COUNT=2"
+  "SONIC_BUILD_RETRY_COUNT=1"
   "PLATFORM=${PLATFORM}"
   "PLATFORM_ARCH=${PLATFORM_ARCH}"
-  "INCLUDE_VS_DASH_SAI=n"
-  "NOTRIXIE=1"
+  "NOBUSTER=1"
+  "NOBULLSEYE=1"
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -356,6 +356,11 @@ fi
 # COMMON: Configure & Build
 # ══════════════════════════════════════════════════════════════════════
 
+MAKE_FLAGS=""
+for f in "${SONIC_BUILD_FLAGS[@]}"; do
+  MAKE_FLAGS+="${f} "
+done
+
 # ── Configure ────────────────────────────────────────────────────────
 info "Running make init && make configure..."
 info "  Streaming to: ${LOG_CONFIGURE}"
@@ -365,7 +370,7 @@ run_in_vm -- sg docker -c "
   cd '${GUEST_WORKDIR}'
   sudo modprobe overlay || true
   make init
-  make configure PLATFORM=${PLATFORM} PLATFORM_ARCH=${PLATFORM_ARCH} NOTRIXIE=1 INCLUDE_VS_DASH_SAI=n
+  make ${MAKE_FLAGS} configure
 " 2>&1 | tee "$LOG_CONFIGURE"
 
 ok "Configure complete."
@@ -375,15 +380,9 @@ info "Starting build: ${BUILD_TARGET}"
 info "  Streaming to: ${LOG_BUILD}"
 info "  This will take a long time..."
 
-MAKE_FLAGS=""
-for f in "${SONIC_BUILD_FLAGS[@]}"; do
-  MAKE_FLAGS+="${f} "
-done
-
 run_in_vm -- sg docker -c "
   set -eux
   cd '${GUEST_WORKDIR}'
-  rm -f rules/p4lang.mk rules/dash-sai.mk
   make ${MAKE_FLAGS} ${BUILD_TARGET}
 " 2>&1 | tee "$LOG_BUILD"
 

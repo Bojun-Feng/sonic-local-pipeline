@@ -1,14 +1,13 @@
-# Lima VM template for SONiC ARM virtual switch builds
-# Requires: macOS with Apple Silicon (M3+ for nested virtualization)
+# Lima VM template for SONiC x86 virtual switch builds
+# Requires: Linux x86_64 host with KVM enabled
 # Usage: limactl create --name=vm-sonic-build ./vm-sonic-build.yaml --tty=false
 
-vmType: "vz"
-arch: "aarch64"
-nestedVirtualization: true
+vmType: "qemu"
+arch: "x86_64"
 
 images:
-  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
-    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
 
 cpus: 4
 memory: "16GiB"
@@ -28,6 +27,49 @@ mounts:
     writable: true
 
 provision:
+  # ── Fail fast if not using hardware virtualization ──
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # Check that we're running under KVM, not TCG (emulation)
+      if [ -f /sys/module/kvm/parameters/enable_apicv ] || \
+         [ -d /sys/module/kvm_intel ] || \
+         [ -d /sys/module/kvm_amd ] || \
+         [ -d /sys/module/kvm ]; then
+        echo "KVM hardware virtualization confirmed."
+      else
+        # Fall back to checking cpuinfo and dmesg
+        if grep -q 'hypervisor' /proc/cpuinfo && \
+           dmesg 2>/dev/null | grep -qi 'kvm'; then
+          echo "KVM hardware virtualization confirmed (via dmesg)."
+        else
+          echo "ERROR: Not running under KVM hardware virtualization!" >&2
+          echo "This VM appears to be using QEMU TCG (emulation), which is too slow." >&2
+          echo "" >&2
+          echo "Ensure your host has:" >&2
+          echo "  1. CPU virtualization enabled in BIOS (VT-x / AMD-V)" >&2
+          echo "  2. KVM module loaded: sudo modprobe kvm_intel  (or kvm_amd)" >&2
+          echo "  3. /dev/kvm exists and is accessible" >&2
+          exit 1
+        fi
+      fi
+
+      # Check if nested virtualization is available inside the guest
+      if [ -e /dev/kvm ]; then
+        echo "Nested virtualization available (/dev/kvm present in guest)."
+      else
+        echo "WARNING: /dev/kvm not found in guest — nested virtualization is NOT available." >&2
+        echo "" >&2
+        echo "To enable nested virtualization on the host, run:" >&2
+        echo "  Intel: echo 1 | sudo tee /sys/module/kvm_intel/parameters/nested" >&2
+        echo "  AMD:   echo 1 | sudo tee /sys/module/kvm_amd/parameters/nested" >&2
+        echo "" >&2
+        echo "Then restart the VM." >&2
+        exit 1
+      fi
+
   # ── System-level prereqs (runs as root) ──
   - mode: system
     script: |
@@ -61,11 +103,9 @@ probes:
     script: |
       #!/bin/bash
       set -eux -o pipefail
-      # Use sudo because the user may not have picked up the docker group yet
       if ! timeout 60 bash -c "until sudo docker info &>/dev/null; do sleep 3; done"; then
         echo >&2 "docker is not ready yet"
         exit 1
       fi
     hint: |
       Docker is not ready in the guest. Check /var/log/cloud-init-output.log inside the VM.
-
