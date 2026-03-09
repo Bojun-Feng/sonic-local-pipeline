@@ -62,10 +62,11 @@
 set -euo pipefail
 
 # ── Configurable ─────────────────────────────────────────────────────
+SECONDS=0
 VM_NAME="vm-sonic-build"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 YAML_TEMPLATE="${SCRIPT_DIR}/vm-sonic-build.yaml"
-OUTPUT_ROOT="$HOME/Documents/sonic-build-pipeline"
+OUTPUT_ROOT="${SCRIPT_DIR}/output"
 
 LOCAL_SONIC_DIR="${SCRIPT_DIR}/sonic-buildimage"
 
@@ -197,12 +198,13 @@ else
   RUN_DIR="${OUTPUT_ROOT}/${TS}"
 fi
 
-LOG_CONFIGURE="${RUN_DIR}/sonic_configure_${TS}.log"
-LOG_BUILD="${RUN_DIR}/sonic_build_${TS}.log"
-LOG_VM="${RUN_DIR}/vm_setup_${TS}.log"
-LOG_COPY="${RUN_DIR}/sonic_copy_${TS}.log"
+LOG_CONFIGURE="${RUN_DIR}/sonic_configure.log"
+LOG_BUILD="${RUN_DIR}/sonic_build.log"
+LOG_VM="${RUN_DIR}/vm_setup.log"
+LOG_COPY="${RUN_DIR}/sonic_copy.log"
 
 mkdir -p "$RUN_DIR"
+ln -sfn "$(basename "$RUN_DIR")" "${OUTPUT_ROOT}/latest"
 
 # ══════════════════════════════════════════════════════════════════════
 # MODE-SPECIFIC: Validate source and set variables
@@ -423,10 +425,27 @@ ok "Build finished."
 # ── Copy artefacts ───────────────────────────────────────────────────
 info "Copying build artefact to ${RUN_DIR}..."
 
+ELAPSED="${SECONDS}"
+
 BIN_NAME="$(basename "$BUILD_TARGET")"
 limactl copy "$VM_NAME:${GUEST_WORKDIR}/${BUILD_TARGET}" "${RUN_DIR}/${BIN_NAME}" \
   && ok "Artefact saved: ${RUN_DIR}/${BIN_NAME}" \
   || err "Could not copy ${BUILD_TARGET}. It may not have been produced."
+
+cat > "${RUN_DIR}/build.meta" <<EOF
+timestamp: ${TS}
+mode: $(if [[ "$LOCAL_MODE" == true ]]; then echo "local"; else echo "remote"; fi)
+commit: $(if [[ "$LOCAL_MODE" == true ]]; then echo "${CURRENT_COMMIT}"; else echo "${COMMIT_HASH}"; fi)
+branch: $(if [[ "$LOCAL_MODE" == true ]]; then echo "${CURRENT_BRANCH}"; else echo "n/a"; fi)
+target: ${BUILD_TARGET}
+platform: ${PLATFORM}
+platform_arch: ${PLATFORM_ARCH}
+vm: ${VM_NAME}
+flags: ${MAKE_FLAGS}
+
+Raw Duration: ${ELAPSED}s
+Duration: $(( ELAPSED / 3600 ))h $(( ELAPSED % 3600 / 60 ))m $(( ELAPSED % 60 ))s
+EOF
 
 # ══════════════════════════════════════════════════════════════════════
 # Summary
@@ -458,4 +477,6 @@ echo "    Build:    ${LOG_BUILD}"
 if [[ -f "${RUN_DIR}/${BIN_NAME}" ]]; then
   echo "  Artefact:   ${RUN_DIR}/${BIN_NAME}"
 fi
+
+echo "  Duration: $(( ELAPSED / 3600 ))h $(( ELAPSED % 3600 / 60 ))m $(( ELAPSED % 60 ))s"
 echo "════════════════════════════════════════════════════════════════"
