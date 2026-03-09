@@ -277,6 +277,38 @@ info "Starting VM..."
 limactl start "$VM_NAME" --tty=false 2>&1 | tee -a "$LOG_VM"
 ok "VM is up."
 
+# ── Verify KVM / nested virtualization ───────────────────────────────
+info "Checking hardware virtualization..."
+run_in_vm -- bash -c '
+  set -eux
+  if [ -f /sys/module/kvm/parameters/enable_apicv ] || \
+     [ -d /sys/module/kvm_intel ] || \
+     [ -d /sys/module/kvm_amd ] || \
+     [ -d /sys/module/kvm ]; then
+    echo "KVM hardware virtualization confirmed."
+  else
+    echo "ERROR: Not running under KVM hardware virtualization!" >&2
+    echo "This VM appears to be using QEMU TCG (emulation), which is too slow." >&2
+    echo "Ensure your host has:" >&2
+    echo "  1. CPU virtualization enabled in BIOS (VT-x / AMD-V)" >&2
+    echo "  2. KVM module loaded: sudo modprobe kvm_intel (or kvm_amd)" >&2
+    echo "  3. /dev/kvm exists and is accessible" >&2
+    exit 1
+  fi
+
+  if [ -e /dev/kvm ]; then
+    echo "Nested virtualization available (/dev/kvm present in guest)."
+  else
+    echo "ERROR: /dev/kvm not found in guest — nested virtualization is NOT available." >&2
+    echo "To enable on the host:" >&2
+    echo "  Intel: echo 1 | sudo tee /sys/module/kvm_intel/parameters/nested" >&2
+    echo "  AMD:   echo 1 | sudo tee /sys/module/kvm_amd/parameters/nested" >&2
+    exit 1
+  fi
+' 2>&1 | tee -a "$LOG_VM" \
+  || fatal "VM is using emulation or lacks nested virtualization. Aborting."
+ok "KVM and nested virtualization confirmed."
+
 # ── Verify docker works inside the VM ────────────────────────────────
 info "Verifying Docker inside guest..."
 run_in_vm -- sudo docker info >/dev/null 2>&1 \
